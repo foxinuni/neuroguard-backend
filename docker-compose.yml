@@ -1,0 +1,31 @@
+services:
+  neuroguard-backend:
+    build: .
+    container_name: neuroguard-backend
+    restart: unless-stopped          # se reinicia automáticamente si cae
+
+    environment:
+      # ── MQTT ──────────────────────────────────────────────
+      MQTT_HOST:      ${MQTT_HOST}
+      MQTT_PORT:      ${MQTT_PORT:-8883}
+      MQTT_USER:      ${MQTT_USER}
+      MQTT_PASSWORD:  ${MQTT_PASSWORD}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-neuroguard-backend-01}
+
+      # ── Firebase ──────────────────────────────────────────
+      FIREBASE_CREDENTIALS_PATH: /app/firebase-credentials.json
+
+      # ── Lógica ────────────────────────────────────────────
+      # Guarda 1 de cada N lecturas en el historial (controla costos Firestore)
+      HISTORY_SUBSAMPLE: ${HISTORY_SUBSAMPLE:-5}
+
+    volumes:
+      # Monta el archivo de credenciales de Firebase desde el host
+      # Nunca incluir este archivo en la imagen Docker
+      - ./firebase-credentials.json:/app/firebase-credentials.json:ro
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
