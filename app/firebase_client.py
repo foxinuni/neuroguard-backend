@@ -2,7 +2,7 @@ import logging
 import os
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, messaging
 
 log = logging.getLogger("neuroguard.firebase")
 
@@ -90,10 +90,27 @@ class FirebaseClient:
     def add_event(self, patient_id: str, device_id: str, event_data: dict):
         """
         Guarda un evento de crisis detectado.
-        Se guarda en la colección events del paciente para el dashboard.
+        1. Comprueba si el paciente tiene una actividad activa → marca como suprimido.
+        2. Guarda el evento en Firestore con el flag 'suppressed' correcto.
+        3. Si NO está suprimido, envía notificación push a los cuidadores.
         """
         try:
-            # En la colección del paciente (para el dashboard médico)
+            # 1. Suprimir si hay actividad activa
+            active_activity = self.get_active_activity(patient_id)
+            if active_activity and active_activity.get("can_suppress", True):
+                event_data["suppressed"] = True
+                event_data["activity_context"] = {
+                    "label": active_activity.get("type", "unknown"),
+                    "confidence": 1.0,
+                }
+                log.info(
+                    f"Evento suprimido por actividad activa: "
+                    f"{active_activity.get('type', 'unknown')}"
+                )
+            else:
+                event_data.setdefault("suppressed", False)
+
+            # 2. Guardar en la colección events del paciente
             patient_ref = (
                 self.db
                 .collection("patients").document(patient_id)
@@ -102,7 +119,7 @@ class FirebaseClient:
             _, doc_ref = patient_ref.add(event_data)
             event_id = doc_ref.id
 
-            # También actualizamos un campo de resumen en el paciente
+            # Actualizar resumen en el documento del paciente
             self.db.collection("patients").document(patient_id).set(
                 {
                     "last_event_timestamp": event_data.get("timestamp"),
@@ -111,9 +128,134 @@ class FirebaseClient:
                 merge=True,
             )
 
-            log.info(f"Evento guardado: patients/{patient_id}/events/{event_id}")
+            log.info(
+                f"Evento guardado: patients/{patient_id}/events/{event_id} "
+                f"(suppressed={event_data['suppressed']})"
+            )
+
+            # 3. Notificar a cuidadores solo si el evento no está suprimido
+            if not event_data["suppressed"]:
+                self.send_fcm_to_caregivers(patient_id, event_data, event_id)
+
         except Exception as e:
             log.error(f"Error guardando evento: {e}")
+
+    # ──────────────────────────────────────────
+    # ACTIVIDADES DEL PACIENTE
+    # ──────────────────────────────────────────
+    def get_active_activity(self, patient_id: str) -> dict | None:
+        """
+        Retorna la actividad activa del paciente (end_timestamp == null), o None.
+        Se usa para suprimir eventos de crisis mientras el paciente está en
+        una actividad registrada (ejercicio, sueño, conducción, etc.).
+        """
+        try:
+            snap = (
+                self.db
+                .collection("patients").document(patient_id)
+                .collection("activities")
+                .where("end_timestamp", "==", None)
+                .limit(1)
+                .get()
+            )
+            return snap[0].to_dict() if snap else None
+        except Exception as e:
+            log.error(f"Error leyendo actividad activa de {patient_id}: {e}")
+            return None
+
+    def get_patient_location(self, patient_id: str) -> dict | None:
+        """
+        Retorna el campo 'location' del perfil del paciente en la colección users.
+        El campo es escrito por LocationService en la app Flutter.
+        Formato: {'latitude': ..., 'longitude': ...}
+        """
+        try:
+            snap = (
+                self.db
+                .collection("users")
+                .where("patient_id", "==", patient_id)
+                .where("role", "==", "patient")
+                .limit(1)
+                .get()
+            )
+            if not snap:
+                return None
+            return snap[0].to_dict().get("location")
+        except Exception as e:
+            log.error(f"Error leyendo ubicación del paciente {patient_id}: {e}")
+            return None
+
+    # ──────────────────────────────────────────
+    # NOTIFICACIONES FCM A CUIDADORES
+    # ──────────────────────────────────────────
+    def send_fcm_to_caregivers(self, patient_id: str, event_data: dict, event_id: str) -> None:
+        """
+        Busca todos los cuidadores vinculados al paciente y les envía una
+        notificación push con el detalle de la crisis y la última ubicación
+        conocida del paciente.
+        """
+        try:
+            caregivers = (
+                self.db
+                .collection("users")
+                .where("role", "==", "caregiver")
+                .where("linked_patient_id", "==", patient_id)
+                .get()
+            )
+            if not caregivers:
+                log.info(f"No hay cuidadores vinculados a {patient_id}, FCM omitido")
+                return
+
+            location = self.get_patient_location(patient_id)
+            severity = event_data.get("severity", "low")
+
+            messages: list[messaging.Message] = []
+            for doc in caregivers:
+                token = doc.to_dict().get("fcm_token")
+                if not token:
+                    log.debug(f"Cuidador {doc.id} no tiene FCM token registrado")
+                    continue
+
+                data_payload: dict[str, str] = {
+                    "type": "crisis_alert",
+                    "patient_id": patient_id,
+                    "event_id": event_id,
+                    "severity": severity,
+                    "timestamp": str(event_data.get("timestamp", "")),
+                }
+                if location:
+                    data_payload["lat"] = str(location.get("lat", ""))
+                    data_payload["lng"] = str(location.get("lng", ""))
+
+                messages.append(
+                    messaging.Message(
+                        notification=messaging.Notification(
+                            title="⚠️ Crisis detectada",
+                            body=(
+                                f"Tu paciente está teniendo un episodio ({severity}). "
+                                "Abre la app para ver su estado."
+                            ),
+                        ),
+                        data=data_payload,
+                        android=messaging.AndroidConfig(priority="high"),
+                        token=token,
+                    )
+                )
+
+            if not messages:
+                log.info(f"Ningún cuidador de {patient_id} tiene FCM token, FCM omitido")
+                return
+
+            response = messaging.send_each(messages)
+            log.info(
+                f"FCM enviado: {response.success_count}/{len(messages)} cuidadores "
+                f"de {patient_id} notificados"
+            )
+            for i, r in enumerate(response.responses):
+                if not r.success:
+                    log.warning(f"  FCM error en cuidador #{i}: {r.exception}")
+        except Exception as e:
+            log.error(f"Error enviando FCM a cuidadores de {patient_id}: {e}")
 
     # ──────────────────────────────────────────
     # ESTADO DEL DISPOSITIVO
