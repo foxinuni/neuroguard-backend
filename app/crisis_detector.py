@@ -19,8 +19,10 @@ UMBRAL_ACC_MAG   = 2.0    # g — magnitud de aceleración indicativa de convuls
 UMBRAL_GYRO_MAG  = 150.0  # °/s — actividad angular elevada
 UMBRAL_HR_ALTO   = 120    # bpm — taquicardia ictal
 UMBRAL_SPO2_BAJO = 90.0   # % — desaturación significativa
-VENTANA_SEGUNDOS = 10     # segundos de actividad elevada para confirmar crisis
-COOLDOWN_SEGUNDOS = 60    # segundos mínimos entre dos alertas del mismo dispositivo
+VENTANA_SEGUNDOS      = 10    # segundos de actividad elevada para confirmar crisis
+COOLDOWN_SEGUNDOS     = 60    # segundos mínimos entre dos alertas del mismo dispositivo
+SAMPLE_INTERVAL_S     = 0.5   # intervalo de publicación del ESP32 (500 ms)
+MIN_WINDOW_FILL_RATIO = 0.70  # la ventana debe estar al menos 70% llena antes de evaluar
 
 
 class CrisisDetector:
@@ -54,9 +56,14 @@ class CrisisDetector:
         while self.buffer and self.buffer[0][0] < cutoff:
             self.buffer.popleft()
 
-        # Necesitamos suficientes muestras para evaluar
-        # A 500ms/muestra → 10s de ventana = ~20 muestras esperadas
-        if len(self.buffer) < 10:
+        # ── Reglas de la ventana de segmentación ─────────
+        # Regla 1: Ventana temporal deslizante de N segundos.
+        # Regla 2: Llenado mínimo del 70% de muestras esperadas antes de evaluar.
+        #          A 500ms/muestra y 10s de ventana → ~20 muestras esperadas, mínimo 14.
+        # Regla 3: ≥60% de muestras con actividad motora elevada (acc o gyro).
+        # Regla 4: Confirmación fisiológica (HR > 120 bpm ó SpO2 < 90%).
+        expected_samples = self.window_seconds / SAMPLE_INTERVAL_S
+        if len(self.buffer) < expected_samples * MIN_WINDOW_FILL_RATIO:
             return None
 
         # ── Evaluar actividad motora ──────────────────────

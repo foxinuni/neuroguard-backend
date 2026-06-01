@@ -72,8 +72,16 @@ def handle_telemetry(patient_id: str, device_id: str, payload: dict):
     2. Guarda la lectura en el historial (cada N muestras para no saturar).
     3. Corre el detector de crisis y si detecta, genera un evento.
     """
-    timestamp = datetime.now(timezone.utc).isoformat()
+    # Usar timestamp del dispositivo (NTP) si viene y es válido; servidor como fallback
+    device_ts = payload.get("timestamp", "")
+    if device_ts and isinstance(device_ts, str) and len(device_ts) > 10:
+        timestamp = device_ts
+        ts_source = "device"
+    else:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        ts_source = "server"
     payload["timestamp"]  = timestamp
+    payload["ts_source"]  = ts_source
     payload["patient_id"] = patient_id
     payload["device_id"]  = device_id
 
