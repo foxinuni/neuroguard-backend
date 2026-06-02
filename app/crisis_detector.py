@@ -2,7 +2,6 @@ import logging
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-import pickle
 
 log = logging.getLogger("neuroguard.detector")
 
@@ -25,13 +24,16 @@ COOLDOWN_SEGUNDOS     = 60    # segundos mínimos entre dos alertas del mismo di
 SAMPLE_INTERVAL_S     = 0.5   # intervalo de publicación del ESP32 (500 ms)
 MIN_WINDOW_FILL_RATIO = 0.70  # la ventana debe estar al menos 70% llena antes de evaluar
 
+
 class CrisisDetector:
     """
-    Detector de posibles crisis tónico-clónicas basado en modelo AI.
+    Detector de posibles crisis tónico-clónicas basado en ventana temporal.
     
     Estrategia multimodal:
     1. Analiza la ventana de los últimos N segundos de lecturas.
-    2. Evalúa el modelo AI para determinar si hay una crisis.
+    2. Si más del 60% de las muestras superan los umbrales motores (acc + gyro),
+       Y se confirma con señal fisiológica (HR alto o SpO2 bajo),
+       → se genera un evento de posible crisis.
     3. Un cooldown evita alertas repetidas del mismo evento continuo.
     """
 
@@ -64,28 +66,39 @@ class CrisisDetector:
         if len(self.buffer) < expected_samples * MIN_WINDOW_FILL_RATIO:
             return None
 
-        # ── Preparar datos para el modelo AI ──────────────
-        features = []
-        for _, r in self.buffer:
-            imu = r.get("imu", {})
-            acc_mag  = imu.get("acc_mag",  0)
-            gyro_mag = imu.get("gyro_mag", 0)
-            hr       = max30.get("hr", 0)
-            spo2     = max30.get("spo2", 100)
+        # ── Evaluar actividad motora ──────────────────────
+        muestras_motor_alto = sum(
+            1 for _, r in self.buffer
+            if self._motor_elevado(r)
+        )
+        porcentaje_motor = muestras_motor_alto / len(self.buffer)
 
-            features.append([acc_mag, gyro_mag, hr, spo2])
+        # ── Evaluar señales fisiológicas ──────────────────
+        ultima_lectura = reading
+        max30 = ultima_lectura.get("max30102", {})
+        hr    = max30.get("hr", 0)
+        spo2  = max30.get("spo2", 100)
+        finger = max30.get("finger", False)
 
-        # ── Evaluar el modelo AI ───────────────────────
-        with open('model.pkl', 'rb') as f:
-            model = pickle.load(f)
+        hr_alto   = finger and hr > UMBRAL_HR_ALTO
+        spo2_bajo = finger and spo2 < UMBRAL_SPO2_BAJO
 
-        prediction = model.predict(features)
-        if prediction == 1:
-            return self._generate_event(now)
-        else:
+        # ── Criterio de crisis ────────────────────────────
+        # Motor sostenido (>60% de la ventana) + al menos una señal fisiológica
+        crisis_detectada = (
+            porcentaje_motor >= 0.60
+            and (hr_alto or spo2_bajo)
+        )
+
+        if not crisis_detectada:
             return None
 
-    def _generate_event(self, now):
+        # ── Cooldown: no repetir alerta del mismo evento ──
+        if (now - self.last_alert_ts) < COOLDOWN_SEGUNDOS:
+            return None
+
+        self.last_alert_ts = now
+
         # ── Construir payload del evento ──────────────────
         imu_vals = [r.get("imu", {}) for _, r in self.buffer]
         acc_vals  = [r.get("acc_mag", 0)  for r in imu_vals]
@@ -108,30 +121,47 @@ class CrisisDetector:
             "source":           "backend",
             "duration_window_s": self.window_seconds,
             "motor": {
+                "pct_elevated":   round(porcentaje_motor * 100, 1),
                 "acc_mag_max":    round(max(acc_vals), 3),
+                "acc_mag_mean":   round(sum(acc_vals) / len(acc_vals), 3),
                 "gyro_mag_max":   round(max(gyro_vals), 3),
+                "gyro_mag_mean":  round(sum(gyro_vals) / len(gyro_vals), 3),
             },
             "physiological": {
                 "hr_basal_bpm": 72.0,
+                "hr_peak_bpm": round(hr, 1),
                 "spo2_min":    round(spo2, 1),
+                "hr_elevated": hr_alto,
+                "spo2_low":    spo2_bajo,
             },
-            "severity": "high",  # Simplified severity for demonstration
+            "severity": self._calcular_severidad(porcentaje_motor, hr, spo2),
         }
 
         log.warning(
             f"[CRISIS] device={self.device_id} "
-            f"motor=??% "
-            f"HR=? SpO2=? % "
+            f"motor={porcentaje_motor*100:.0f}% "
+            f"HR={hr:.0f} SpO2={spo2:.0f}% "
             f"severity={evento['severity']}"
         )
         return evento
 
-# Example usage:
-detector = CrisisDetector("device1")
-reading = {
-    "imu": {"acc_mag": 2.5, "gyro_mag": 200},
-    "max30102": {"hr": 140, "spo2": 85}
-}
-event = detector.evaluate(reading)
-if event:
-    print(event)
+    def _motor_elevado(self, reading: dict) -> bool:
+        """True si la lectura muestra actividad motora por encima del umbral."""
+        imu = reading.get("imu", {})
+        acc_mag  = imu.get("acc_mag",  0)
+        gyro_mag = imu.get("gyro_mag", 0)
+        return acc_mag > UMBRAL_ACC_MAG or gyro_mag > UMBRAL_GYRO_MAG
+
+    def _calcular_severidad(self, pct_motor: float, hr: float, spo2: float) -> str:
+        """Clasificación de severidad: low / medium / high."""
+        score = 0
+        if pct_motor >= 0.80: score += 2
+        elif pct_motor >= 0.60: score += 1
+        if hr > 140:    score += 2
+        elif hr > 120:  score += 1
+        if spo2 < 85:   score += 2
+        elif spo2 < 90: score += 1
+
+        if score >= 4: return "high"
+        if score >= 2: return "medium"
+        return "low"
